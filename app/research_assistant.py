@@ -250,8 +250,25 @@ def compact_exception_message(exc: BaseException, max_chars: int = 400) -> str:
 
 
 def is_invalid_json_behavior_error(exc: BaseException) -> bool:
-    message = str(exc).lower()
-    return "invalid json" in message and "modelbehaviorerror" in message
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(type(current).__name__)
+        parts.append(str(current))
+        next_exc: BaseException | None = None
+        if isinstance(current.__cause__, BaseException):
+            next_exc = current.__cause__
+        elif isinstance(current.__context__, BaseException):
+            next_exc = current.__context__
+        current = next_exc
+
+    haystack = "\n".join(parts).lower()
+    return "invalid json" in haystack and (
+        "modelbehaviorerror" in haystack or "invalid json when parsing" in haystack
+    )
 
 
 def current_year_context() -> str:
