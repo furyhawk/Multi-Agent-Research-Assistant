@@ -33,7 +33,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "local")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8011/v1")
 OLOSTEP_API_KEY = os.getenv("OLOSTEP_API_KEY")
 SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "https://search.furyhawk.lol")
-LOCAL_TRACE_DIR = os.getenv("LOCAL_TRACE_DIR", ".states/debug_traces")
+LOCAL_TRACE_DIR = os.getenv("LOCAL_TRACE_DIR", ".debug_traces")
 MODEL = os.getenv("OPENAI_MODEL", "unsloth/gemma-4-E4B-it-GGUF")
 
 # Ensure the OpenAI-compatible client used by the agents SDK points at the local server.
@@ -209,6 +209,17 @@ def compact_json(data: Any, max_chars: int = 8000) -> str:
     return text[:max_chars] + "\n... [truncated]"
 
 
+def compact_exception_message(exc: BaseException, max_chars: int = 400) -> str:
+    message = str(exc).strip()
+    if message:
+        message = f"{type(exc).__name__}: {message}"
+    else:
+        message = type(exc).__name__
+    if len(message) <= max_chars:
+        return message
+    return message[: max_chars - 15].rstrip() + " ... [truncated]"
+
+
 def current_year_context() -> str:
     return str(datetime.now().year)
 
@@ -329,7 +340,7 @@ def _search_with_scrape_impl(query: str, limit: int = 5) -> str:
                 "results": normalize_search_links(data.get("links", []), limit=limit),
                 "raw": data,
             },
-            max_chars=12000,
+            max_chars=6000,
         )
 
 
@@ -348,7 +359,9 @@ async def answer_query(query: str) -> str:
     try:
         result = await asyncio.to_thread(_answer_query_impl, query)
     except Exception as exc:
-        raise OlostepError(f"Olostep Answer API failed: {exc}") from exc
+        raise OlostepError(
+            f"Olostep Answer API failed: {compact_exception_message(exc)}"
+        ) from exc
     await emit_progress("Olostep Answer API returned evidence.")
     return result
 
@@ -360,7 +373,9 @@ async def search_web(query: str, limit: int = 8) -> str:
     try:
         result = await asyncio.to_thread(_search_web_impl, query, limit)
     except Exception as exc:
-        raise OlostepError(f"Local SearXNG search failed: {exc}") from exc
+        raise OlostepError(
+            f"Local SearXNG search failed: {compact_exception_message(exc)}"
+        ) from exc
     await emit_progress("Local SearXNG search returned results.")
     return result
 
@@ -372,7 +387,9 @@ async def search_with_scrape(query: str, limit: int = 5) -> str:
     try:
         result = await asyncio.to_thread(_search_with_scrape_impl, query, limit)
     except Exception as exc:
-        raise OlostepError(f"Olostep Search with Scrape failed: {exc}") from exc
+        raise OlostepError(
+            f"Olostep Search with Scrape failed: {compact_exception_message(exc)}"
+        ) from exc
     await emit_progress("Search with scrape returned source content.")
     return result
 
@@ -384,7 +401,9 @@ async def scrape_url(url: str) -> str:
     try:
         result = await asyncio.to_thread(_scrape_url_impl, url)
     except Exception as exc:
-        raise OlostepError(f"Olostep Scrape API failed: {exc}") from exc
+        raise OlostepError(
+            f"Olostep Scrape API failed: {compact_exception_message(exc)}"
+        ) from exc
     await emit_progress("Selected source scrape completed.")
     return result
 
@@ -519,7 +538,12 @@ Evidence to judge:
 Return a structured judgment for whether this evidence is sufficient to answer the original question.
 """
     with custom_span("judge.answer_quality", {"stage": stage}):
-        result = await Runner.run(judge_agent, prompt, max_turns=3)
+        try:
+            result = await Runner.run(judge_agent, prompt, max_turns=3)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Judge agent failed: {compact_exception_message(exc)}"
+            ) from exc
     judgment = result.final_output
     await emit_progress(
         f"Judge score: {judgment.score:.2f} "
@@ -634,7 +658,12 @@ Return a polished, reader-friendly Markdown research report with substantial det
             metadata={"query": query, "app": "reflex_research_assistant"},
         ):
             with custom_span("manager.run", {"query": query}):
-                result = await Runner.run(manager_agent, prompt, max_turns=30)
+                try:
+                    result = await Runner.run(manager_agent, prompt, max_turns=30)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Manager agent failed: {compact_exception_message(exc)}"
+                    ) from exc
 
         report, used_fallback = coerce_markdown_research_report(result.final_output, query)
         record_local_trace_event(
@@ -657,7 +686,7 @@ Return a polished, reader-friendly Markdown research report with substantial det
             "manager_run_error",
             {
                 "error_type": type(exc).__name__,
-                "error": str(exc),
+                "error": compact_exception_message(exc, max_chars=1200),
             },
         )
         raise

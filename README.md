@@ -85,6 +85,7 @@ OPENAI_BASE_URL=http://localhost:8011/v1
 OLOSTEP_API_KEY=your_olostep_api_key
 SEARXNG_BASE_URL=https://search.furyhawk.lol
 OPENAI_MODEL=unsloth/gemma-4-E4B-it-GGUF
+LOCAL_TRACE_DIR=.debug_traces
 ```
 
 `search_web` uses the local SearXNG endpoint configured by `SEARXNG_BASE_URL`.

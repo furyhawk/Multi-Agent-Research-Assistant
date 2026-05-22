@@ -1,5 +1,6 @@
 tmp
 .states
+.debug_traces
 .web
 *.py[cod]
 # Reflex generated files
