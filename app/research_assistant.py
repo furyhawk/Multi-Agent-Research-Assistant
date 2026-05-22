@@ -52,6 +52,8 @@ _local_trace_buffer: contextvars.ContextVar[list[dict[str, Any]] | None] = (
     contextvars.ContextVar("local_trace_buffer", default=None)
 )
 
+TRACE_FIELD_MAX_CHARS = 3500
+
 
 def _is_openai_cloud_base_url() -> bool:
     return OPENAI_BASE_URL.rstrip("/") == "https://api.openai.com/v1"
@@ -191,6 +193,13 @@ def compact_json(data: Any, max_chars: int = 8000) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n... [truncated]"
+
+
+def compact_text(text: Any, max_chars: int = TRACE_FIELD_MAX_CHARS) -> str:
+    rendered = str(text)
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars - 15].rstrip() + " ... [truncated]"
 
 
 def compact_exception_message(exc: BaseException, max_chars: int = 400) -> str:
@@ -369,7 +378,10 @@ def _search_web_impl(query: str, limit: int = 8) -> str:
                 "provider": "searxng",
                 "base_url": SEARXNG_BASE_URL,
                 "results": normalized_results,
-                "raw": data,
+                "raw_summary": {
+                    "result_count": len(raw_results),
+                    "keys": list(data.keys()) if isinstance(data, dict) else [],
+                },
             }
         )
 
@@ -410,9 +422,12 @@ def _search_with_scrape_impl(query: str, limit: int = 5) -> str:
                 "query": query,
                 "provider": "searxng_plus_direct_fetch",
                 "results": scraped_rows,
-                "raw": data,
+                "raw_summary": {
+                    "result_count": len(raw_results),
+                    "keys": list(data.keys()) if isinstance(data, dict) else [],
+                },
             },
-            max_chars=9000,
+            max_chars=7000,
         )
 
 
@@ -428,7 +443,7 @@ def _scrape_url_impl(url: str) -> str:
                     "markdown_content": page.get("text", "")[:10000],
                 },
             },
-            max_chars=10000,
+            max_chars=7000,
         )
 
 
@@ -613,7 +628,7 @@ Evidence stage:
 {stage}
 
 Evidence to judge:
-{evidence}
+{compact_text(evidence, max_chars=6000)}
 
 Return a structured judgment for whether this evidence is sufficient to answer the original question.
 """
@@ -733,7 +748,10 @@ Return a polished, reader-friendly Markdown research report with substantial det
         with trace(
             workflow_name="multi_agent_research_assistant_local_search",
             trace_id=trace_id,
-            metadata={"query": query, "app": "reflex_research_assistant"},
+            metadata={
+                "query": compact_text(query, max_chars=1200),
+                "app": "reflex_research_assistant",
+            },
         ):
             with custom_span("manager.run", {"query": query}):
                 try:
