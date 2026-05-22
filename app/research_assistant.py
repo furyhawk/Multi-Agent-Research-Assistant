@@ -25,9 +25,14 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "local")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8011/v1")
 OLOSTEP_API_KEY = os.getenv("OLOSTEP_API_KEY")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+MODEL = os.getenv("OPENAI_MODEL", "unsloth/gemma-4-E4B-it-GGUF")
+
+# Ensure the OpenAI-compatible client used by the agents SDK points at the local server.
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+os.environ["OPENAI_BASE_URL"] = OPENAI_BASE_URL
 
 warnings.filterwarnings("ignore", message=".*extra field.*SDK model.*")
 
@@ -76,6 +81,8 @@ async def emit_progress(message: str) -> None:
 
 
 def openai_trace_url(trace_id: str) -> str:
+    if OPENAI_BASE_URL.rstrip("/") != "https://api.openai.com/v1":
+        return ""
     return f"https://platform.openai.com/logs/trace?trace_id={trace_id}"
 
 
@@ -83,7 +90,6 @@ def environment_status() -> tuple[bool, list[str], str, str]:
     missing = [
         name
         for name, value in {
-            "OPENAI_API_KEY": OPENAI_API_KEY,
             "OLOSTEP_API_KEY": OLOSTEP_API_KEY,
         }.items()
         if not value
@@ -374,10 +380,6 @@ manager_agent = Agent(
 async def run_research_assistant(
     query: str, progress: ProgressCallback | None = None
 ) -> tuple[MarkdownResearchReport, str]:
-    if not OPENAI_API_KEY:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not set. Add it to .env and restart the app."
-        )
     require_olostep_key()
 
     token = _progress_callback.set(progress)

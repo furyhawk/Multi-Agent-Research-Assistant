@@ -80,9 +80,10 @@ pip install -r requirements.txt
 Create a `.env` file from `.env.template`:
 
 ```bash
-OPENAI_API_KEY=your_openai_api_key
+OPENAI_API_KEY=local
+OPENAI_BASE_URL=http://localhost:8011/v1
 OLOSTEP_API_KEY=your_olostep_api_key
-OPENAI_MODEL=gpt-5.4-mini
+OPENAI_MODEL=unsloth/gemma-4-E4B-it-GGUF
 ```
 
 ## Run the Reflex app
