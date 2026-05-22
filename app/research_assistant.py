@@ -714,10 +714,59 @@ analyst_agent = Agent(
     output_type=MarkdownResearchReport,
 )
 
-analyst_tool = analyst_agent.as_tool(
-    tool_name="write_markdown_research_report",
-    tool_description="Write the final structured Markdown research report from the gathered evidence.",
+analyst_agent_unstructured = Agent(
+    name="Analyst agent",
+    model=MODEL,
+    instructions=analyst_agent.instructions,
 )
+
+
+@function_tool
+async def write_markdown_research_report(input_text: str) -> str:
+    """Write the final structured Markdown research report from the gathered evidence."""
+    await emit_progress("Analyst writing final research report.")
+    with custom_span("analyst.write_report", {}):
+        try:
+            result = await Runner.run(analyst_agent, input_text, max_turns=4)
+            report = result.final_output
+        except Exception as exc:
+            if not is_invalid_json_behavior_error(exc):
+                raise RuntimeError(
+                    f"Analyst agent failed: {compact_exception_message(exc)}"
+                ) from exc
+
+            record_local_trace_event(
+                "analyst_run_retry_unstructured",
+                {
+                    "reason": compact_exception_message(exc, max_chars=1000),
+                },
+            )
+            await emit_progress(
+                "Analyst returned non-JSON output; retrying without strict structured parsing."
+            )
+            try:
+                retry_result = await Runner.run(
+                    analyst_agent_unstructured,
+                    input_text,
+                    max_turns=4,
+                )
+            except Exception as retry_exc:
+                raise RuntimeError(
+                    "Analyst agent failed after JSON fallback retry: "
+                    f"{compact_exception_message(retry_exc)}"
+                ) from retry_exc
+
+            report, used_fallback = coerce_markdown_research_report(
+                retry_result.final_output,
+                input_text,
+            )
+            if used_fallback:
+                await emit_progress(
+                    "Analyst markdown was normalized into the structured report format."
+                )
+            return report.model_dump_json()
+
+    return report.model_dump_json()
 
 manager_agent = Agent(
     name="Manager research agent",
@@ -751,7 +800,7 @@ manager_agent = Agent(
         search_with_scrape,
         search_web,
         scrape_url,
-        analyst_tool,
+        write_markdown_research_report,
     ],
     output_type=MarkdownResearchReport,
 )
@@ -766,7 +815,7 @@ manager_agent_unstructured = Agent(
         search_with_scrape,
         search_web,
         scrape_url,
-        analyst_tool,
+        write_markdown_research_report,
     ],
 )
 
