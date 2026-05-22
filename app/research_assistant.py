@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import importlib.metadata
 import html
@@ -34,6 +35,12 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8011/v1")
 SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "https://search.furyhawk.lol")
 LOCAL_TRACE_DIR = os.getenv("LOCAL_TRACE_DIR", ".debug_traces")
 MODEL = os.getenv("OPENAI_MODEL", "gemma-4-E4B-it-GGUF")
+ENABLE_REMOTE_TRACING = os.getenv("ENABLE_REMOTE_TRACING", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # Ensure the OpenAI-compatible client used by the agents SDK points at the local server.
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -57,6 +64,17 @@ TRACE_FIELD_MAX_CHARS = 3500
 
 def _is_openai_cloud_base_url() -> bool:
     return OPENAI_BASE_URL.rstrip("/") == "https://api.openai.com/v1"
+
+
+def should_use_remote_tracing() -> bool:
+    if not ENABLE_REMOTE_TRACING:
+        return False
+    if not _is_openai_cloud_base_url():
+        return False
+    # Avoid cloud trace upload attempts when a local placeholder key is still configured.
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "local":
+        return False
+    return True
 
 
 def _safe_trace_name(trace_id: str) -> str:
@@ -192,7 +210,25 @@ def compact_json(data: Any, max_chars: int = 8000) -> str:
     text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "\n... [truncated]"
+
+    # Keep the return value as syntactically valid JSON when truncation is needed.
+    preview_budget = max(80, max_chars - 120)
+    fallback_payload = {
+        "truncated": True,
+        "original_chars": len(text),
+        "preview": compact_text(text, max_chars=preview_budget),
+    }
+    fallback_text = json.dumps(
+        fallback_payload,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    )
+    if len(fallback_text) <= max_chars:
+        return fallback_text
+
+    # Final minimal JSON fallback for very small max_chars values.
+    return json.dumps({"truncated": True}, ensure_ascii=False)
 
 
 def compact_text(text: Any, max_chars: int = TRACE_FIELD_MAX_CHARS) -> str:
@@ -211,6 +247,11 @@ def compact_exception_message(exc: BaseException, max_chars: int = 400) -> str:
     if len(message) <= max_chars:
         return message
     return message[: max_chars - 15].rstrip() + " ... [truncated]"
+
+
+def is_invalid_json_behavior_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "invalid json" in message and "modelbehaviorerror" in message
 
 
 def current_year_context() -> str:
@@ -440,7 +481,7 @@ def _scrape_url_impl(url: str) -> str:
                 "scrape": {
                     "title": page.get("title") or "Untitled",
                     "content_type": page.get("content_type") or "",
-                    "markdown_content": page.get("text", "")[:10000],
+                    "markdown_content": page.get("text", "")[:9000],
                 },
             },
             max_chars=7000,
@@ -715,6 +756,20 @@ manager_agent = Agent(
     output_type=MarkdownResearchReport,
 )
 
+manager_agent_unstructured = Agent(
+    name="Manager research agent",
+    model=MODEL,
+    instructions=manager_agent.instructions,
+    tools=[
+        answer_query,
+        judge_answer_quality,
+        search_with_scrape,
+        search_web,
+        scrape_url,
+        analyst_tool,
+    ],
+)
+
 
 async def run_research_assistant(
     query: str, progress: ProgressCallback | None = None
@@ -722,7 +777,8 @@ async def run_research_assistant(
     token = _progress_callback.set(progress)
     local_trace_token: contextvars.Token[list[dict[str, Any]] | None] | None = None
     trace_id = gen_trace_id()
-    if not _is_openai_cloud_base_url():
+    use_remote_tracing = should_use_remote_tracing()
+    if not use_remote_tracing:
         local_trace_token = _local_trace_buffer.set([])
         record_local_trace_event("local_trace_started", {"query": query})
     trace_url = openai_trace_url(trace_id)
@@ -745,21 +801,49 @@ Return a polished, reader-friendly Markdown research report with substantial det
 - If the second judge still says the evidence is weak, do not judge again. Run multiple targeted search_web calls, choose at least the top 3 relevant source URLs from the search results, and scrape those top 3 pages for context.
 - Analyst agent writes the final Markdown report from all answer, judge, search, and scrape evidence. Do not include Limitations or Next Steps sections.
 """
-        with trace(
-            workflow_name="multi_agent_research_assistant_local_search",
-            trace_id=trace_id,
-            metadata={
-                "query": compact_text(query, max_chars=1200),
-                "app": "reflex_research_assistant",
-            },
-        ):
+        trace_context = (
+            trace(
+                workflow_name="multi_agent_research_assistant_local_search",
+                trace_id=trace_id,
+                metadata={
+                    "query": compact_text(query, max_chars=1200),
+                    "app": "reflex_research_assistant",
+                },
+            )
+            if use_remote_tracing
+            else contextlib.nullcontext()
+        )
+        with trace_context:
             with custom_span("manager.run", {"query": query}):
                 try:
                     result = await Runner.run(manager_agent, prompt, max_turns=30)
                 except Exception as exc:
-                    raise RuntimeError(
-                        f"Manager agent failed: {compact_exception_message(exc)}"
-                    ) from exc
+                    if not is_invalid_json_behavior_error(exc):
+                        raise RuntimeError(
+                            f"Manager agent failed: {compact_exception_message(exc)}"
+                        ) from exc
+
+                    record_local_trace_event(
+                        "manager_run_retry_unstructured",
+                        {
+                            "reason": compact_exception_message(exc, max_chars=1000),
+                        },
+                    )
+                    await emit_progress(
+                        "Manager returned non-JSON output; retrying without strict structured parsing."
+                    )
+
+                    try:
+                        result = await Runner.run(
+                            manager_agent_unstructured,
+                            prompt,
+                            max_turns=30,
+                        )
+                    except Exception as retry_exc:
+                        raise RuntimeError(
+                            "Manager agent failed after JSON fallback retry: "
+                            f"{compact_exception_message(retry_exc)}"
+                        ) from retry_exc
 
         report, used_fallback = coerce_markdown_research_report(result.final_output, query)
         record_local_trace_event(
@@ -773,9 +857,12 @@ Return a polished, reader-friendly Markdown research report with substantial det
             await emit_progress(
                 "Model returned plain markdown; normalized it into a structured report format."
             )
-        await emit_progress("Manager run completed. Flushing OpenAI traces.")
-        flush_traces()
-        await emit_progress("Trace flushed. Rendering Markdown report.")
+        if use_remote_tracing:
+            await emit_progress("Manager run completed. Flushing OpenAI traces.")
+            flush_traces()
+            await emit_progress("Trace flushed. Rendering Markdown report.")
+        else:
+            await emit_progress("Manager run completed. Rendering Markdown report.")
         return report, trace_url
     except Exception as exc:
         record_local_trace_event(
