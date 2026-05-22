@@ -5,6 +5,10 @@ import contextvars
 import importlib.metadata
 import json
 import os
+import re
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 import warnings
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -28,6 +32,8 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "local")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8011/v1")
 OLOSTEP_API_KEY = os.getenv("OLOSTEP_API_KEY")
+SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "https://search.furyhawk.lol")
+LOCAL_TRACE_DIR = os.getenv("LOCAL_TRACE_DIR", ".states/debug_traces")
 MODEL = os.getenv("OPENAI_MODEL", "unsloth/gemma-4-E4B-it-GGUF")
 
 # Ensure the OpenAI-compatible client used by the agents SDK points at the local server.
@@ -43,6 +49,75 @@ _progress_callback: contextvars.ContextVar[ProgressCallback | None] = (
         default=None,
     )
 )
+_local_trace_buffer: contextvars.ContextVar[list[dict[str, Any]] | None] = (
+    contextvars.ContextVar("local_trace_buffer", default=None)
+)
+
+
+def _is_openai_cloud_base_url() -> bool:
+    return OPENAI_BASE_URL.rstrip("/") == "https://api.openai.com/v1"
+
+
+def _safe_trace_name(trace_id: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]", "_", (trace_id or "").strip())
+    if not sanitized:
+        sanitized = datetime.now().strftime("trace_%Y%m%d_%H%M%S")
+    return sanitized
+
+
+def _local_trace_path(trace_id: str) -> Path:
+    base_path = Path(LOCAL_TRACE_DIR)
+    safe_name = _safe_trace_name(trace_id)
+
+    # Allow both directory-style and file-style LOCAL_TRACE_DIR values.
+    if base_path.suffix.lower() == ".json":
+        candidate = base_path
+    else:
+        candidate = base_path / f"{safe_name}.json"
+
+    # If candidate exists as a directory, place the trace file inside it.
+    if candidate.exists() and candidate.is_dir():
+        candidate = candidate / f"{safe_name}.json"
+
+    return candidate
+
+
+def record_local_trace_event(event: str, details: dict[str, Any]) -> None:
+    buffer = _local_trace_buffer.get()
+    if buffer is None:
+        return
+    buffer.append(
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            "details": details,
+        }
+    )
+
+
+def flush_local_trace(trace_id: str) -> str:
+    buffer = _local_trace_buffer.get()
+    if buffer is None:
+        return ""
+
+    trace_path = _local_trace_path(trace_id)
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "trace_id": trace_id,
+        "openai_base_url": OPENAI_BASE_URL,
+        "model": MODEL,
+        "events": buffer,
+    }
+    try:
+        trace_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return str(trace_path)
+    except IsADirectoryError:
+        fallback = Path(LOCAL_TRACE_DIR) / f"{_safe_trace_name(trace_id)}.json"
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        fallback.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(fallback)
 
 
 class OlostepError(RuntimeError):
@@ -81,8 +156,8 @@ async def emit_progress(message: str) -> None:
 
 
 def openai_trace_url(trace_id: str) -> str:
-    if OPENAI_BASE_URL.rstrip("/") != "https://api.openai.com/v1":
-        return ""
+    if not _is_openai_cloud_base_url():
+        return str(_local_trace_path(trace_id))
     return f"https://platform.openai.com/logs/trace?trace_id={trace_id}"
 
 
@@ -163,13 +238,74 @@ def _answer_query_impl(query: str) -> str:
 
 
 def _search_web_impl(query: str, limit: int = 8) -> str:
-    with custom_span("olostep.search_web", {"query": query, "limit": limit}):
-        search = get_olostep_client().searches.create(query=query, limit=limit)
-        data = sdk_result_to_dict(search)
+    request_params = {
+        "q": query,
+        "format": "json",
+        "language": "auto",
+        "safesearch": "0",
+    }
+    request_url = f"{SEARXNG_BASE_URL.rstrip('/')}/search?{urlencode(request_params)}"
+    request_headers = {
+        "Accept": "application/json",
+        "User-Agent": "multi-agent-research-assistant/0.1",
+    }
+
+    with custom_span(
+        "searxng.search_web",
+        {"query": query, "limit": limit, "base_url": SEARXNG_BASE_URL},
+    ):
+        with urlopen(Request(request_url, headers=request_headers), timeout=20) as response:
+            raw_response = response.read().decode("utf-8", errors="replace")
+
+        try:
+            data = json.loads(raw_response)
+        except json.JSONDecodeError as exc:
+            record_local_trace_event(
+                "searxng_json_decode_error",
+                {
+                    "query": query,
+                    "error": str(exc),
+                    "response_preview": raw_response[:1200],
+                },
+            )
+            raise RuntimeError(
+                "SearXNG returned invalid JSON. See local trace for response preview."
+            ) from exc
+
+        raw_results = data.get("results") if isinstance(data, dict) else []
+        if not isinstance(raw_results, list):
+            record_local_trace_event(
+                "searxng_unexpected_schema",
+                {
+                    "query": query,
+                    "results_type": type(raw_results).__name__,
+                    "payload_preview": compact_json(data, max_chars=1200),
+                },
+            )
+            raw_results = []
+
+        normalized_results = []
+        for item in raw_results[:limit]:
+            if not isinstance(item, dict):
+                continue
+            normalized_results.append(
+                {
+                    "title": item.get("title") or "Untitled",
+                    "url": item.get("url") or item.get("link") or "",
+                    "description": item.get("content")
+                    or item.get("description")
+                    or item.get("snippet")
+                    or "",
+                    "engine": item.get("engine") or "searxng",
+                }
+            )
+
         return compact_json(
             {
                 "query": query,
-                "results": normalize_search_links(data.get("links", []), limit=limit),
+                "provider": "searxng",
+                "base_url": SEARXNG_BASE_URL,
+                "results": normalized_results,
                 "raw": data,
             }
         )
@@ -219,13 +355,13 @@ async def answer_query(query: str) -> str:
 
 @function_tool
 async def search_web(query: str, limit: int = 8) -> str:
-    """Search the web using Olostep Search and return normalized results."""
-    await emit_progress(f"Searching the web with Olostep: {query}")
+    """Search the web using local SearXNG and return normalized results."""
+    await emit_progress(f"Searching the web with local SearXNG: {query}")
     try:
         result = await asyncio.to_thread(_search_web_impl, query, limit)
     except Exception as exc:
-        raise OlostepError(f"Olostep Search API failed: {exc}") from exc
-    await emit_progress("Olostep Search returned results.")
+        raise OlostepError(f"Local SearXNG search failed: {exc}") from exc
+    await emit_progress("Local SearXNG search returned results.")
     return result
 
 
@@ -257,6 +393,90 @@ def _format_missing_information(missing_information: list[str]) -> str:
     if not missing_information:
         return "none"
     return "; ".join(missing_information[:3])
+
+
+def _first_heading_or_default(markdown_text: str, query: str) -> str:
+    for line in markdown_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip() or f"Research report: {query[:80]}"
+    return f"Research report: {query[:80]}"
+
+
+def _extract_summary(markdown_text: str) -> str:
+    paragraph_lines: list[str] = []
+    for line in markdown_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if paragraph_lines:
+                break
+            continue
+        if stripped.startswith("#"):
+            continue
+        paragraph_lines.append(stripped)
+    if paragraph_lines:
+        return " ".join(paragraph_lines)[:500]
+    return "Summary unavailable from model output."
+
+
+def _extract_key_findings(markdown_text: str) -> list[str]:
+    findings: list[str] = []
+    for line in markdown_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            findings.append(stripped[2:].strip())
+        if len(findings) >= 5:
+            break
+    return findings
+
+
+def _extract_citations(markdown_text: str) -> list[str]:
+    urls = re.findall(r"https?://[^\s)\]]+", markdown_text)
+    # Keep order while removing duplicates.
+    seen: set[str] = set()
+    ordered = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            ordered.append(url)
+    return ordered
+
+
+def coerce_markdown_research_report(
+    raw_output: Any, query: str
+) -> tuple[MarkdownResearchReport, bool]:
+    if isinstance(raw_output, MarkdownResearchReport):
+        return raw_output, False
+
+    if isinstance(raw_output, dict):
+        return MarkdownResearchReport.model_validate(raw_output), False
+
+    text = str(raw_output).strip()
+    if not text:
+        raise RuntimeError("Model returned an empty report.")
+
+    try:
+        return MarkdownResearchReport.model_validate_json(text), False
+    except Exception:
+        pass
+
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return MarkdownResearchReport.model_validate(parsed), False
+    except Exception:
+        pass
+
+    report = MarkdownResearchReport(
+        title=_first_heading_or_default(text, query),
+        executive_summary=_extract_summary(text),
+        key_findings=_extract_key_findings(text),
+        markdown_report=text,
+        citations=_extract_citations(text),
+        confidence="medium",
+        method_used="manager_orchestrated_local_model_fallback",
+    )
+    return report, True
 
 
 judge_agent = Agent(
@@ -383,10 +603,18 @@ async def run_research_assistant(
     require_olostep_key()
 
     token = _progress_callback.set(progress)
+    local_trace_token: contextvars.Token[list[dict[str, Any]] | None] | None = None
     trace_id = gen_trace_id()
+    if not _is_openai_cloud_base_url():
+        local_trace_token = _local_trace_buffer.set([])
+        record_local_trace_event("local_trace_started", {"query": query})
     trace_url = openai_trace_url(trace_id)
 
     try:
+        record_local_trace_event(
+            "manager_run_started",
+            {"trace_id": trace_id, "workflow": "multi_agent_research_assistant_olostep"},
+        )
         await emit_progress("Starting manager research agent.")
         prompt = f"""
 Research question:
@@ -408,9 +636,35 @@ Return a polished, reader-friendly Markdown research report with substantial det
             with custom_span("manager.run", {"query": query}):
                 result = await Runner.run(manager_agent, prompt, max_turns=30)
 
+        report, used_fallback = coerce_markdown_research_report(result.final_output, query)
+        record_local_trace_event(
+            "manager_run_completed",
+            {
+                "used_report_fallback": used_fallback,
+                "trace_url": trace_url,
+            },
+        )
+        if used_fallback:
+            await emit_progress(
+                "Model returned plain markdown; normalized it into a structured report format."
+            )
         await emit_progress("Manager run completed. Flushing OpenAI traces.")
         flush_traces()
         await emit_progress("Trace flushed. Rendering Markdown report.")
-        return result.final_output, trace_url
+        return report, trace_url
+    except Exception as exc:
+        record_local_trace_event(
+            "manager_run_error",
+            {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        raise
     finally:
+        if local_trace_token is not None:
+            local_trace_file = flush_local_trace(trace_id)
+            if local_trace_file:
+                await emit_progress(f"Local debug trace written: {local_trace_file}")
+            _local_trace_buffer.reset(local_trace_token)
         _progress_callback.reset(token)

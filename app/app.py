@@ -271,6 +271,37 @@ def result_area() -> rx.Component:
     )
 
 
+def trace_panel() -> rx.Component:
+    return rx.cond(
+        (State.trace_url != "") & (~State.trace_url.startswith("https://")),
+        rx.box(
+            rx.hstack(
+                rx.icon("file_search", size=16, color="#155e75"),
+                rx.text("Local Trace", weight="medium", color="#134e4a"),
+                spacing="2",
+                align="center",
+            ),
+            rx.link(
+                State.trace_url,
+                href=State.trace_url,
+                is_external=True,
+                color="#0f766e",
+                text_decoration="underline",
+                word_break="break-all",
+                font_family="monospace",
+                font_size="0.82rem",
+                margin_top="0.35rem",
+                display="block",
+            ),
+            padding="0.65rem 0.85rem",
+            border="1px solid #a7f3d0",
+            border_radius="8px",
+            background="rgba(236, 253, 245, 0.9)",
+            width="100%",
+        ),
+    )
+
+
 def index() -> rx.Component:
     return rx.box(
         rx.vstack(
@@ -281,6 +312,7 @@ def index() -> rx.Component:
                 State.error != "",
                 rx.callout(State.error, icon="triangle_alert", color_scheme="red", width="100%"),
             ),
+            trace_panel(),
             result_area(),
             spacing="5",
             align="stretch",

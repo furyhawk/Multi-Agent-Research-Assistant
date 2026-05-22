@@ -66,7 +66,7 @@ The manager follows a staged retrieval policy:
 1. Call the Olostep Answer API for a simple first answer.
 2. Ask the Judge whether that answer is sufficient (`score >= 0.85`).
 3. If weak, run Olostep Search with Scrape and ask the Judge again using the same `0.85` threshold.
-4. If still weak, run multiple targeted Olostep Search calls, select at least the top 3 relevant URLs, and scrape those pages.
+4. If still weak, run multiple targeted local SearXNG searches, select at least the top 3 relevant URLs, and scrape those pages.
 5. Send all answer, judge, search, and scrape evidence to the Analyst for the final report.
 
 ## Setup
@@ -83,8 +83,11 @@ Create a `.env` file from `.env.template`:
 OPENAI_API_KEY=local
 OPENAI_BASE_URL=http://localhost:8011/v1
 OLOSTEP_API_KEY=your_olostep_api_key
+SEARXNG_BASE_URL=https://search.furyhawk.lol
 OPENAI_MODEL=unsloth/gemma-4-E4B-it-GGUF
 ```
+
+`search_web` uses the local SearXNG endpoint configured by `SEARXNG_BASE_URL`.
 
 ## Run the Reflex app
 
