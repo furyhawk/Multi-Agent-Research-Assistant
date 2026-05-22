@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import importlib.metadata
+import html
 import json
 import os
 import re
@@ -24,17 +25,15 @@ from agents import (
     trace,
 )
 from dotenv import load_dotenv
-from olostep import Olostep
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "local")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8011/v1")
-OLOSTEP_API_KEY = os.getenv("OLOSTEP_API_KEY")
 SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "https://search.furyhawk.lol")
 LOCAL_TRACE_DIR = os.getenv("LOCAL_TRACE_DIR", ".debug_traces")
-MODEL = os.getenv("OPENAI_MODEL", "unsloth/gemma-4-E4B-it-GGUF")
+MODEL = os.getenv("OPENAI_MODEL", "gemma-4-E4B-it-GGUF")
 
 # Ensure the OpenAI-compatible client used by the agents SDK points at the local server.
 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -120,8 +119,8 @@ def flush_local_trace(trace_id: str) -> str:
         return str(fallback)
 
 
-class OlostepError(RuntimeError):
-    """Raised when an Olostep SDK request fails."""
+class RetrievalError(RuntimeError):
+    """Raised when local retrieval tools fail."""
 
 
 class Judgment(BaseModel):
@@ -165,31 +164,16 @@ def environment_status() -> tuple[bool, list[str], str, str]:
     missing = [
         name
         for name, value in {
-            "OLOSTEP_API_KEY": OLOSTEP_API_KEY,
+            "SEARXNG_BASE_URL": SEARXNG_BASE_URL,
         }.items()
         if not value
     ]
-    try:
-        olostep_version = importlib.metadata.version("olostep")
-    except importlib.metadata.PackageNotFoundError:
-        olostep_version = "not installed"
+    searxng_version = "http endpoint"
     try:
         openai_version = importlib.metadata.version("openai-agents")
     except importlib.metadata.PackageNotFoundError:
         openai_version = "not installed"
-    return not missing, missing, olostep_version, openai_version
-
-
-def require_olostep_key() -> str:
-    if not OLOSTEP_API_KEY:
-        raise OlostepError(
-            "OLOSTEP_API_KEY is not set. Add it to .env and restart the app."
-        )
-    return OLOSTEP_API_KEY
-
-
-def get_olostep_client() -> Olostep:
-    return Olostep(api_key=require_olostep_key())
+    return not missing, missing, searxng_version, openai_version
 
 
 def sdk_result_to_dict(result: Any) -> dict[str, Any]:
@@ -242,10 +226,78 @@ def normalize_search_links(
     return rows
 
 
+def _text_from_html(raw_html: str) -> str:
+    cleaned = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", " ", raw_html, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _extract_title_from_html(raw_html: str) -> str:
+    title_match = re.search(r"<title>(.*?)</title>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    if not title_match:
+        return "Untitled"
+    return re.sub(r"\s+", " ", html.unescape(title_match.group(1))).strip() or "Untitled"
+
+
+def _fetch_url_content(url: str, timeout: int = 20, max_chars: int = 120000) -> dict[str, Any]:
+    request_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "User-Agent": "multi-agent-research-assistant/0.1",
+    }
+
+    with urlopen(Request(url, headers=request_headers), timeout=timeout) as response:
+        raw_bytes = response.read()
+        content_type = response.headers.get("Content-Type", "")
+        charset_match = re.search(r"charset=([^;\s]+)", content_type, flags=re.IGNORECASE)
+        encoding = (charset_match.group(1).strip('"\'') if charset_match else "utf-8") or "utf-8"
+
+    decoded = raw_bytes.decode(encoding, errors="replace")
+    if len(decoded) > max_chars:
+        decoded = decoded[:max_chars]
+
+    title = _extract_title_from_html(decoded)
+    text_content = _text_from_html(decoded)
+    return {
+        "url": url,
+        "title": title,
+        "content_type": content_type,
+        "text": text_content,
+    }
+
+
 def _answer_query_impl(query: str) -> str:
-    with custom_span("olostep.answer_query", {"query": query}):
-        result = get_olostep_client().answers.create(task=query)
-        return compact_json(sdk_result_to_dict(result))
+    with custom_span("searxng.answer_query", {"query": query}):
+        search_payload_text = _search_web_impl(query, limit=6)
+        payload = json.loads(search_payload_text)
+        results = payload.get("results", [])
+
+        evidence = []
+        for item in results[:5]:
+            evidence.append(
+                {
+                    "title": item.get("title") or "Untitled",
+                    "url": item.get("url") or "",
+                    "snippet": item.get("description") or "",
+                    "engine": item.get("engine") or "searxng",
+                }
+            )
+
+        answer_summary = " ".join(
+            f"[{row['title']}] {row['snippet']}" for row in evidence if row.get("snippet")
+        )[:1800]
+
+        return compact_json(
+            {
+                "query": query,
+                "provider": "searxng",
+                "summary": answer_summary,
+                "evidence": evidence,
+            },
+            max_chars=6000,
+        )
 
 
 def _search_web_impl(query: str, limit: int = 8) -> str:
@@ -323,46 +375,74 @@ def _search_web_impl(query: str, limit: int = 8) -> str:
 
 
 def _search_with_scrape_impl(query: str, limit: int = 5) -> str:
-    scrape_options = {"formats": ["markdown"], "timeout": 25}
-    with custom_span(
-        "olostep.search_with_scrape",
-        {"query": query, "limit": limit, "scrape_options": scrape_options},
-    ):
-        search = get_olostep_client().searches.create(
-            query=query,
-            limit=limit,
-            scrape_options=scrape_options,
-        )
-        data = sdk_result_to_dict(search)
+    with custom_span("searxng.search_with_scrape", {"query": query, "limit": limit}):
+        data = json.loads(_search_web_impl(query, limit=max(limit, 3)))
+        raw_results = data.get("results", [])
+        scraped_rows: list[dict[str, Any]] = []
+
+        for item in raw_results[:limit]:
+            url = item.get("url") or ""
+            if not url:
+                continue
+            try:
+                page = _fetch_url_content(url, timeout=20)
+                scraped_rows.append(
+                    {
+                        "title": item.get("title") or page.get("title") or "Untitled",
+                        "url": url,
+                        "description": item.get("description") or "",
+                        "markdown_chars": len(page.get("text", "")),
+                        "markdown_preview": page.get("text", "")[:1500],
+                    }
+                )
+            except Exception as exc:
+                scraped_rows.append(
+                    {
+                        "title": item.get("title") or "Untitled",
+                        "url": url,
+                        "description": item.get("description") or "",
+                        "error": compact_exception_message(exc),
+                    }
+                )
+
         return compact_json(
             {
                 "query": query,
-                "results": normalize_search_links(data.get("links", []), limit=limit),
+                "provider": "searxng_plus_direct_fetch",
+                "results": scraped_rows,
                 "raw": data,
             },
-            max_chars=6000,
+            max_chars=9000,
         )
 
 
 def _scrape_url_impl(url: str) -> str:
-    with custom_span("olostep.scrape_url", {"url": url, "formats": ["markdown"]}):
-        scrape = get_olostep_client().scrapes.create(url=url, formats=["markdown"])
+    with custom_span("url.scrape", {"url": url}):
+        page = _fetch_url_content(url, timeout=20)
         return compact_json(
-            {"url": url, "scrape": sdk_result_to_dict(scrape)}, max_chars=10000
+            {
+                "url": url,
+                "scrape": {
+                    "title": page.get("title") or "Untitled",
+                    "content_type": page.get("content_type") or "",
+                    "markdown_content": page.get("text", "")[:10000],
+                },
+            },
+            max_chars=10000,
         )
 
 
 @function_tool
 async def answer_query(query: str) -> str:
-    """Answer a natural-language research query using Olostep Answer API."""
-    await emit_progress("Calling Olostep Answer API.")
+    """Answer a research query using local SearXNG evidence."""
+    await emit_progress("Collecting initial evidence from local SearXNG.")
     try:
         result = await asyncio.to_thread(_answer_query_impl, query)
     except Exception as exc:
-        raise OlostepError(
-            f"Olostep Answer API failed: {compact_exception_message(exc)}"
+        raise RetrievalError(
+            f"Initial SearXNG retrieval failed: {compact_exception_message(exc)}"
         ) from exc
-    await emit_progress("Olostep Answer API returned evidence.")
+    await emit_progress("Initial SearXNG evidence collected.")
     return result
 
 
@@ -373,7 +453,7 @@ async def search_web(query: str, limit: int = 8) -> str:
     try:
         result = await asyncio.to_thread(_search_web_impl, query, limit)
     except Exception as exc:
-        raise OlostepError(
+        raise RetrievalError(
             f"Local SearXNG search failed: {compact_exception_message(exc)}"
         ) from exc
     await emit_progress("Local SearXNG search returned results.")
@@ -382,13 +462,13 @@ async def search_web(query: str, limit: int = 8) -> str:
 
 @function_tool
 async def search_with_scrape(query: str, limit: int = 5) -> str:
-    """Search the web and scrape each returned link using Olostep Search with Scrape."""
-    await emit_progress(f"Running Olostep search with scrape: {query}")
+    """Search the web and scrape each returned link using SearXNG plus direct fetch."""
+    await emit_progress(f"Running search with scrape via local retrieval: {query}")
     try:
         result = await asyncio.to_thread(_search_with_scrape_impl, query, limit)
     except Exception as exc:
-        raise OlostepError(
-            f"Olostep Search with Scrape failed: {compact_exception_message(exc)}"
+        raise RetrievalError(
+            f"Search with scrape failed: {compact_exception_message(exc)}"
         ) from exc
     await emit_progress("Search with scrape returned source content.")
     return result
@@ -396,13 +476,13 @@ async def search_with_scrape(query: str, limit: int = 5) -> str:
 
 @function_tool
 async def scrape_url(url: str) -> str:
-    """Scrape one URL with Olostep and return compact page content."""
+    """Scrape one URL and return compact page content."""
     await emit_progress(f"Scraping selected source: {url}")
     try:
         result = await asyncio.to_thread(_scrape_url_impl, url)
     except Exception as exc:
-        raise OlostepError(
-            f"Olostep Scrape API failed: {compact_exception_message(exc)}"
+        raise RetrievalError(
+            f"URL scrape failed: {compact_exception_message(exc)}"
         ) from exc
     await emit_progress("Selected source scrape completed.")
     return result
@@ -624,8 +704,6 @@ manager_agent = Agent(
 async def run_research_assistant(
     query: str, progress: ProgressCallback | None = None
 ) -> tuple[MarkdownResearchReport, str]:
-    require_olostep_key()
-
     token = _progress_callback.set(progress)
     local_trace_token: contextvars.Token[list[dict[str, Any]] | None] | None = None
     trace_id = gen_trace_id()
@@ -637,7 +715,7 @@ async def run_research_assistant(
     try:
         record_local_trace_event(
             "manager_run_started",
-            {"trace_id": trace_id, "workflow": "multi_agent_research_assistant_olostep"},
+            {"trace_id": trace_id, "workflow": "multi_agent_research_assistant_local_search"},
         )
         await emit_progress("Starting manager research agent.")
         prompt = f"""
@@ -653,7 +731,7 @@ Return a polished, reader-friendly Markdown research report with substantial det
 - Analyst agent writes the final Markdown report from all answer, judge, search, and scrape evidence. Do not include Limitations or Next Steps sections.
 """
         with trace(
-            workflow_name="multi_agent_research_assistant_olostep",
+            workflow_name="multi_agent_research_assistant_local_search",
             trace_id=trace_id,
             metadata={"query": query, "app": "reflex_research_assistant"},
         ):

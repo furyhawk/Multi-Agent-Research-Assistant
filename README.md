@@ -1,6 +1,6 @@
 # Multi-Agent Research Assistant
 
-A multi-agent research assistant built with the OpenAI Agents SDK, Olostep, and Reflex.
+A multi-agent research assistant built with the OpenAI Agents SDK, local SearXNG retrieval, and Reflex.
 
 https://github.com/user-attachments/assets/9aee7d1e-7d3d-4c11-b286-a6b11fef2d8d
 
@@ -14,7 +14,7 @@ User question
     v
 Manager agent
     |
-    +--> Olostep Answer API
+    +--> Initial local SearXNG retrieval
     |        |
     |        v
     |    Judge agent
@@ -55,7 +55,7 @@ Manager agent
 
 | Agent | Role |
 |---|---|
-| **Manager** | Orchestrates the workflow and directly calls Olostep answer, search, and scrape tools. |
+| **Manager** | Orchestrates the workflow and directly calls local retrieval and scrape tools. |
 | **Judge** | Evaluates the simple answer and search-with-scrape evidence before deciding whether to continue. |
 | **Analyst** | Writes the final Markdown research report from the gathered evidence. |
 
@@ -63,9 +63,9 @@ Manager agent
 
 The manager follows a staged retrieval policy:
 
-1. Call the Olostep Answer API for a simple first answer.
+1. Call local SearXNG retrieval for a simple first answer.
 2. Ask the Judge whether that answer is sufficient (`score >= 0.85`).
-3. If weak, run Olostep Search with Scrape and ask the Judge again using the same `0.85` threshold.
+3. If weak, run search with scrape and ask the Judge again using the same `0.85` threshold.
 4. If still weak, run multiple targeted local SearXNG searches, select at least the top 3 relevant URLs, and scrape those pages.
 5. Send all answer, judge, search, and scrape evidence to the Analyst for the final report.
 
@@ -82,7 +82,6 @@ Create a `.env` file from `.env.template`:
 ```bash
 OPENAI_API_KEY=local
 OPENAI_BASE_URL=http://localhost:8011/v1
-OLOSTEP_API_KEY=your_olostep_api_key
 SEARXNG_BASE_URL=https://search.furyhawk.lol
 OPENAI_MODEL=unsloth/gemma-4-E4B-it-GGUF
 LOCAL_TRACE_DIR=.debug_traces
@@ -110,13 +109,13 @@ The app files live in `app/`:
 |---|---|
 | `app/app.py` | Reflex UI components and page registration only. |
 | `app/state.py` | Reflex state, event handlers, progress logging, stop/reset behavior, and downloads. |
-| `app/research_assistant.py` | OpenAI Agents SDK workflow with Manager, Judge, Analyst, and Olostep tools. |
+| `app/research_assistant.py` | OpenAI Agents SDK workflow with Manager, Judge, Analyst, and local SearXNG/url tools. |
 | `app/report_formatting.py` | Markdown cleanup, browser HTML rendering, link behavior, and report CSS. |
 | `app/pdf_export.py` | ReportLab-based PDF generation with headings, bullets, links, and Markdown table support. |
 
 ## Features
 
-- **Multi-agent workflow**: Manager, Judge, and Analyst agents collaborate while the manager directly controls Olostep retrieval tools.
+- **Multi-agent workflow**: Manager, Judge, and Analyst agents collaborate while the manager directly controls local retrieval tools.
 - **Live progress logs**: Watch each agent step in real time.
 - **Styled Markdown report**: Headings, bullets, tables, code blocks, and more render properly in the browser.
 - **Download report**: Export the full report as a formatted PDF using ReportLab.
